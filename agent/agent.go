@@ -36,6 +36,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang/groupcache/lru"
@@ -89,8 +90,17 @@ var (
 	monitoringResourceType   = flag.String("monitoring-resource-type", "gce_instance", "The monitoring resource type. Eg: gce_instance")
 	monitoringResourceLabels = flag.String("monitoring-resource-labels", "", "Comma separated key value pairs specifying the resource labels. Eg: 'instance-id=12345678901234,instance-zone=us-west1-a")
 
+	enableGracefulShutdown  = flag.Bool("enable-graceful-shutdown", false, "Whether or not to enable graceful shutdown")
+	gracefulShutdownTimeout = flag.Duration("graceful-shutdown-timeout", 30*time.Second, "Timeout for graceful shutdown")
+
 	sessionLRU    *sessions.Cache
 	metricHandler *metrics.MetricHandler
+
+	shutdownListenerMu          sync.Mutex
+	shutdownListeners           []func(ctx context.Context, notifyOnStoppedWg *sync.WaitGroup)
+	requestPollingQuitCh        chan struct{}
+	requestPollingEndNotifierCh chan struct{}
+	inflightRequestsWg          sync.WaitGroup
 )
 
 func hostProxy(ctx context.Context, host, shimPath string, injectShimCode bool) (http.Handler, error) {
@@ -175,6 +185,8 @@ func healthCheck() error {
 
 // processOneRequest reads a single request from the proxy and forwards it to the backend server.
 func processOneRequest(client *http.Client, hostProxy http.Handler, backendID string, requestID string) {
+	inflightRequestsWg.Add(1)
+	defer inflightRequestsWg.Done()
 	requestForwarder := func(client *http.Client, request *utils.ForwardedRequest) error {
 		if err := forwardRequest(client, hostProxy, request); err != nil {
 			log.Printf("Failure forwarding a request: [%s] %q\n", requestID, err.Error())
@@ -190,19 +202,27 @@ func processOneRequest(client *http.Client, hostProxy http.Handler, backendID st
 // pollForNewRequests repeatedly reaches out to the proxy server to ask if any pending are available, and then
 // processes any newly-seen ones.
 func pollForNewRequests(client *http.Client, hostProxy http.Handler, backendID string) {
+	defer close(requestPollingEndNotifierCh)
 	previouslySeenRequests := lru.New(requestCacheLimit)
+
 	var retryCount uint
 	for {
-		if requests, err := utils.ListPendingRequests(client, *proxy, backendID, metricHandler); err != nil {
-			log.Printf("Failed to read pending requests: %q\n", err.Error())
-			time.Sleep(utils.ExponentialBackoffDuration(retryCount))
-			retryCount++
-		} else {
-			retryCount = 0
-			for _, requestID := range requests {
-				if _, ok := previouslySeenRequests.Get(requestID); !ok {
-					previouslySeenRequests.Add(requestID, requestID)
-					go processOneRequest(client, hostProxy, backendID, requestID)
+		select {
+		case <-requestPollingQuitCh:
+			log.Println("Received quit signal, stop polling requests.")
+			return
+		default:
+			if requests, err := utils.ListPendingRequests(client, *proxy, backendID, metricHandler); err != nil {
+				log.Printf("Failed to read pending requests: %q\n", err.Error())
+				time.Sleep(utils.ExponentialBackoffDuration(retryCount))
+				retryCount++
+			} else {
+				retryCount = 0
+				for _, requestID := range requests {
+					if _, ok := previouslySeenRequests.Get(requestID); !ok {
+						previouslySeenRequests.Add(requestID, requestID)
+						go processOneRequest(client, hostProxy, backendID, requestID)
+					}
 				}
 			}
 		}
@@ -294,9 +314,93 @@ func runAdapter(ctx context.Context) error {
 	return nil
 }
 
+// Wait for the already pulled requests from the proxy to be processed
+// before shutting down the agent.
+func waitForInflightRequests(ctx context.Context, notifyOnStoppedWg *sync.WaitGroup) {
+	defer notifyOnStoppedWg.Done()
+
+	stopRequestPolling(ctx)
+
+	waitCh := make(chan struct{})
+	go func() {
+		inflightRequestsWg.Wait()
+		close(waitCh)
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("waitForInflightRequests: context finished with err: %v\n", ctx.Err())
+			return
+		case <-waitCh:
+			log.Println("waitForInflightRequests: all inflight requests processed.")
+			return
+		}
+	}
+}
+
+// Stop polling the proxy for new requests during graceful shutdown.
+// This function returns when either the polling has stopped completely or
+// context deadline has passed.
+func stopRequestPolling(ctx context.Context) {
+	close(requestPollingQuitCh)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("stopRequestPolling: context finished with err: %v\n", ctx.Err())
+			return
+		case <-requestPollingEndNotifierCh:
+			log.Println("stopRequestPolling: stopped successfully.")
+			return
+		}
+	}
+}
+
+// Register shutdown event listeners to be called during the graceful shutdown window.
+func registerOnShutdown(f func(ctx context.Context, notifyOnStoppedWg *sync.WaitGroup)) {
+	shutdownListenerMu.Lock()
+	defer shutdownListenerMu.Unlock()
+	shutdownListeners = append(shutdownListeners, f)
+}
+
+// Call the registered shutdown listeners and wait for them to finish until the
+// context timeout allows.
+func graceFulShutdown(ctx context.Context) {
+	log.Println("Graceful shutdown initiated.")
+	shutdownListenerMu.Lock()
+	defer func() {
+		shutdownListenerMu.Unlock()
+		log.Println("Graceful shutdown complete.")
+	}()
+
+	var wg sync.WaitGroup
+	for _, f := range shutdownListeners {
+		wg.Add(1)
+		go f(ctx, &wg)
+	}
+	waitCh := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(waitCh)
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("Graceful shutdown: context finished with err: %v\n", ctx.Err())
+			return
+		case <-waitCh:
+			log.Println("Graceful shutdown: all registered listeners finished operation.")
+			return
+		}
+	}
+}
+
 func main() {
 	flag.Parse()
 	ctx := context.Background()
+	requestPollingQuitCh = make(chan struct{})
+	requestPollingEndNotifierCh = make(chan struct{})
 
 	if *proxy == "" {
 		log.Fatal("You must specify the address of the proxy")
@@ -319,7 +423,20 @@ func main() {
 	waitForHealthy()
 	go runHealthChecks()
 
-	if err := runAdapter(ctx); err != nil {
-		log.Fatal(err.Error())
+	go func(ctx context.Context) {
+		if err := runAdapter(ctx); err != nil {
+			log.Fatal(err.Error())
+		}
+	}(ctx)
+
+	osShutdownSignalCh := utils.ShutdownSignalChan()
+	<-osShutdownSignalCh
+
+	if *enableGracefulShutdown {
+		registerOnShutdown(waitForInflightRequests)
+
+		shutdownCtx, cancel := context.WithTimeout(ctx, *gracefulShutdownTimeout)
+		defer cancel()
+		graceFulShutdown(shutdownCtx)
 	}
 }
